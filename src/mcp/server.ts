@@ -1,0 +1,486 @@
+import { realpathSync } from "node:fs";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  InitializedNotificationSchema,
+  ListToolsRequestSchema,
+  RootsListChangedNotificationSchema,
+  type Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import { toJSONSchema, z, ZodError } from "zod";
+
+import { DomainError } from "../core/errors.js";
+import {
+  acceptanceCriteriaPreSubmissionCheck,
+  formatMcpInstructions,
+} from "../core/agent-instructions.js";
+import { runtimeVersion } from "../server/runtime-version.js";
+import {
+  createTaskInputSchema,
+  createTasksInputSchema,
+  completeReviewInputSchema,
+  submitForReviewInputSchema,
+  getProjectStatusInputSchema,
+  getTaskInputSchema,
+  listTasksInputSchema,
+  reviewFindingInputSchema,
+  startReviewInputSchema,
+  startTaskInputSchema,
+  checkTaskIntegrationInputSchema,
+  updateTaskInputSchema,
+} from "../core/query-contract.js";
+import {
+  discoverProjectRoot,
+  openProjectContext,
+  resolveProjectRoot,
+  resolveWorkspaceProjectRoot,
+  type ProjectContext,
+} from "../project/project-context.js";
+
+import { imageReferencesSchema, importTaskImageSchema, getTaskImageInputSchema } from "../core/task-images.js";
+import { importTaskImage, readTaskImage, resolveTaskImageInput } from "../images/image-store.js";
+
+const agentCreateTaskSchema = createTaskInputSchema.omit({
+  projectId: true,
+  status: true,
+  queuePosition: true,
+  createdBy: true,
+  images: true,
+}).extend(imageReferencesSchema.shape);
+const agentCreateTasksSchema = z
+  .object({ tasks: z.array(agentCreateTaskSchema).min(1) })
+  .strict();
+const projectStatusArgumentsSchema = getProjectStatusInputSchema.omit({
+  projectId: true,
+  since: true,
+});
+const listTasksArgumentsSchema = listTasksInputSchema.omit({ projectId: true });
+const taskArgumentsSchema = getTaskInputSchema.omit({ projectId: true });
+const startTaskArgumentsSchema = startTaskInputSchema.omit({ projectId: true });
+const updateTaskArgumentsSchema = updateTaskInputSchema.omit({ projectId: true });
+const submitForReviewArgumentsSchema = submitForReviewInputSchema.omit({ projectId: true });
+const startReviewArgumentsSchema = startReviewInputSchema.omit({ projectId: true });
+const completeReviewArgumentsSchema = completeReviewInputSchema.omit({ projectId: true });
+const checkIntegrationArgumentsSchema = checkTaskIntegrationInputSchema.omit({ projectId: true });
+const reviewDecisionArgumentsSchema = completeReviewArgumentsSchema.omit({
+  decision: true,
+});
+const requestChangesArgumentsSchema = reviewDecisionArgumentsSchema
+  .omit({ verificationEvidence: true })
+  .extend({ findings: z.array(reviewFindingInputSchema).min(1) });
+
+const toolDefinitions: Tool[] = [
+  { name: "import_task_image", description: "Copy a plan/reference image into this project. Supply localPath (absolute local image path) or dataBase64, plus an optional name. Use the returned id in create_task/create_tasks imageIds. PNG, JPEG, GIF and WebP; at most 10 MB each.", inputSchema: toJSONSchema(importTaskImageSchema) as Tool["inputSchema"] },
+  { name: "get_task_image", description: "View an image attached to a task. Returns actual image content and its stored local path. After get_task, inspect every relevant task.images entry before implementation.", inputSchema: toJSONSchema(getTaskImageInputSchema) as Tool["inputSchema"] },
+  {
+    name: "get_project_status",
+    description:
+      "Use this when no taskId is known to read the current project work and ordered ready queue. Choose only ready tasks with runnable=true; waiting tasks include their unfinished dependencies.",
+    inputSchema: toJSONSchema(projectStatusArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "list_tasks",
+    description:
+      "Read one task status section with a bounded limit and opaque cursor. Results use the existing ready-queue or recent-completion ordering.",
+    inputSchema: toJSONSchema(listTasksArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "get_task",
+    description:
+      "Read a known taskId's definition and the context for its current phase. The default working view returns the phase (implementation or review), dependency state, the current run's progress, every acceptance criterion with its stable id and full text, the latest submission with per-criterion delivery results, previous-round findings awaiting closure, and unclosed findings from changes-requested rounds. Pass view='full' to retrieve the complete immutable event and review histories. This does not require get_project_status first.",
+    inputSchema: toJSONSchema(taskArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "create_task",
+    description:
+      `Record one newly discovered task in the project's inbox. Optionally include the model label. Agent-created tasks are not ready until a developer confirms and orders them. ${acceptanceCriteriaPreSubmissionCheck}`,
+    inputSchema: toJSONSchema(agentCreateTaskSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "create_tasks",
+    description:
+      `Record several newly discovered inbox tasks atomically, optionally including model labels. If one input is invalid, the complete batch is rolled back. ${acceptanceCriteriaPreSubmissionCheck}`,
+    inputSchema: toJSONSchema(agentCreateTasksSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "start_task",
+    description:
+      "After get_task, atomically claim a runnable ready task. Optionally include the model label. Save the returned runId and include it in every subsequent execution update.",
+    inputSchema: toJSONSchema(startTaskArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "update_task",
+    description:
+      "Record meaningful progress for a running task. The runId must belong to the current execution.",
+    inputSchema: toJSONSchema(updateTaskArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "submit_for_review",
+    description:
+      "Submit a running task for review with a completion summary, an optional commit SHA, and exactly one delivery result per acceptance criterion, filed under the criterion id returned by get_task (met, not_met, or unverifiable; met requires recorded evidence). The task changes to in_review and the runId becomes invalid after submission.",
+    inputSchema: toJSONSchema(submitForReviewArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "start_review",
+    description:
+      "Atomically claim the latest pending review and save the returned reviewRunId before inspecting the submitted artifact.",
+    inputSchema: toJSONSchema(startReviewArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "approve_review",
+    description:
+      "Pass the claimed review with a summary, structured findings, finding closures, and verification evidence. Every new finding records issue, suggestion, severity, trigger, impact, and evidence, plus a location when one can be identified. When the previous round requested changes, record a closure status for every previous finding; unresolved or partially fixed findings and not_met or unverifiable delivery results block passing. The reviewRunId must own the current review; all tasks require manual developer approval before archival.",
+    inputSchema: toJSONSchema(reviewDecisionArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "request_changes",
+    description:
+      "Return the claimed review for rework with actionable findings and finding closures. Findings require trigger, impact, and evidence; a re-review must close every finding from the previous changes-requested round. The reviewRunId must own the current review; the task returns to ready and requires a new execution runId.",
+    inputSchema: toJSONSchema(requestChangesArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "complete_review",
+    description:
+      "Record a passed or changes-requested AI review with structured findings, finding closures, and verification evidence. Passing is rejected when submitted acceptance criteria are not met or unverifiable, or when a previous-round finding remains not_fixed or partially_fixed. Git commit and integration are optional traceability; every task requires manual developer approval for archival.",
+    inputSchema: toJSONSchema(completeReviewArgumentsSchema) as Tool["inputSchema"],
+  },
+  {
+    name: "check_task_integration",
+    description:
+      "Reconcile a manually approved latest review without requiring a Git integration check. Supply the expected review id from get_task. This never merges, fetches, pushes, or substitutes another commit SHA.",
+    inputSchema: toJSONSchema(checkIntegrationArgumentsSchema) as Tool["inputSchema"],
+  },
+];
+
+function formatError(error: unknown): string {
+  if (error instanceof DomainError) {
+    return `${error.code}: ${error.message}`;
+  }
+  if (error instanceof ZodError) {
+    const issues = error.issues.map((issue) => ({
+      path: issue.path.join("."),
+      message: issue.message,
+    }));
+    return `INVALID_INPUT: ${JSON.stringify(issues)}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function jsonResult(value: unknown) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(value, null, 2),
+      },
+    ],
+  };
+}
+
+function errorResult(error: unknown) {
+  return {
+    isError: true,
+    content: [{ type: "text" as const, text: formatError(error) }],
+  };
+}
+
+export function createMcpServer(
+  contextOrResolver: ProjectContext | (() => Promise<ProjectContext>),
+): Server {
+  const getContext =
+    typeof contextOrResolver === "function"
+      ? contextOrResolver
+      : async () => contextOrResolver;
+
+  const server = new Server(
+    { name: "milestack", version: runtimeVersion },
+    {
+      capabilities: { tools: {} },
+      instructions: formatMcpInstructions(),
+    },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    await getContext();
+    return {
+      tools: toolDefinitions,
+    };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+      const context = await getContext();
+      const args = request.params.arguments ?? {};
+      switch (request.params.name) {
+        case "import_task_image":
+          return jsonResult(importTaskImage(context.projectRoot, importTaskImageSchema.parse(args)));
+        case "get_task_image": {
+          const parsed = getTaskImageInputSchema.parse(args);
+          const details = context.service.getTask({ projectId: context.project.id, taskId: parsed.taskId, view: "full" });
+          if (!details.task.images.some((image) => image.id === parsed.imageId)) throw new Error("图片未附加到指定任务。");
+          const { image, bytes, localPath } = readTaskImage(context.projectRoot, parsed.imageId);
+          return { content: [{ type: "text" as const, text: JSON.stringify({ ...image, localPath }) },
+            { type: "image" as const, mimeType: image.mimeType, data: bytes.toString("base64") }] };
+        }
+        case "get_project_status": {
+          const parsed = projectStatusArgumentsSchema.parse(args);
+          const input = getProjectStatusInputSchema.parse({
+            ...parsed,
+            projectId: context.project.id,
+            view: parsed.view ?? "compact",
+          });
+          return jsonResult(context.service.getProjectStatus(input));
+        }
+        case "list_tasks": {
+          const parsed = listTasksArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.listTasks({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "get_task": {
+          const parsed = taskArgumentsSchema.parse(args);
+          const input = getTaskInputSchema.parse({
+            ...parsed,
+            projectId: context.project.id,
+          });
+          return jsonResult(context.service.getTask(input));
+        }
+        case "create_task": {
+          const { imageIds, imagePaths, ...parsed } = agentCreateTaskSchema.parse(args);
+          const input = createTaskInputSchema.parse({
+            ...parsed,
+            images: resolveTaskImageInput(context.projectRoot, { imageIds, imagePaths }),
+            projectId: context.project.id,
+            createdBy: "agent",
+          });
+          return jsonResult(context.service.createTask(input));
+        }
+        case "create_tasks": {
+          const parsed = agentCreateTasksSchema.parse(args);
+          const input = createTasksInputSchema.parse({
+            projectId: context.project.id,
+            tasks: parsed.tasks.map(({ imageIds, imagePaths, ...task }) => ({
+              ...task,
+              images: resolveTaskImageInput(context.projectRoot, { imageIds, imagePaths }),
+              createdBy: "agent",
+            })),
+          });
+          return jsonResult(context.service.createTasks(input));
+        }
+        case "start_task": {
+          const parsed = startTaskArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.startTask({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "update_task": {
+          const parsed = updateTaskArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.updateTask({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "submit_for_review": {
+          const parsed = submitForReviewArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.submitForReview({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "start_review": {
+          const parsed = startReviewArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.startReview({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "approve_review": {
+          const parsed = reviewDecisionArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.completeReview({
+              ...parsed,
+              projectId: context.project.id,
+              decision: "passed",
+            }),
+          );
+        }
+        case "request_changes": {
+          const parsed = requestChangesArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.completeReview({
+              ...parsed,
+              projectId: context.project.id,
+              decision: "changes_requested",
+              verificationEvidence: [],
+            }),
+          );
+        }
+        case "complete_review": {
+          const parsed = completeReviewArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.completeReview({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        case "check_task_integration": {
+          const parsed = checkIntegrationArgumentsSchema.parse(args);
+          return jsonResult(
+            context.service.checkTaskIntegration({
+              ...parsed,
+              projectId: context.project.id,
+            }),
+          );
+        }
+        default:
+          return errorResult(new Error(`Unknown tool '${request.params.name}'.`));
+      }
+    } catch (error) {
+      return errorResult(error);
+    }
+  });
+
+  return server;
+}
+
+export type RunMcpOptions = {
+  projectRoot?: string;
+  discover?: boolean;
+};
+
+export async function runMcp(
+  optionsOrProjectRoot: string | RunMcpOptions,
+): Promise<void> {
+  const options: RunMcpOptions =
+    typeof optionsOrProjectRoot === "string"
+      ? { projectRoot: optionsOrProjectRoot }
+      : optionsOrProjectRoot;
+
+  let currentContext: ProjectContext | undefined;
+
+  if (!options.discover) {
+    const projectRoot = options.projectRoot ?? resolveProjectRoot();
+    currentContext = await openProjectContext(projectRoot);
+    const server = createMcpServer(currentContext);
+    const transport = new StdioServerTransport();
+    transport.onclose = () => currentContext?.database.close();
+
+    try {
+      await server.connect(transport);
+    } catch (error) {
+      currentContext.database.close();
+      throw error;
+    }
+    return;
+  }
+
+  // Discover mode:
+  const envRoots = (process.env.WORKSPACE_DIRS || process.env.ANTIGRAVITY_WORKSPACE_DIRS)
+    ?.split(/[:;,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let initialProjectRoot: string;
+  if (envRoots && envRoots.length > 0) {
+    initialProjectRoot = resolveWorkspaceProjectRoot(envRoots);
+  } else {
+    initialProjectRoot = discoverProjectRoot();
+  }
+
+  currentContext = await openProjectContext(initialProjectRoot);
+
+  let rootsValidationPromise: Promise<void> | undefined;
+
+  const validateRoots = async (roots: readonly string[]): Promise<void> => {
+    const newProjectRoot = resolveWorkspaceProjectRoot(roots);
+    let canonicalNew = newProjectRoot;
+    let canonicalCurrent = currentContext!.projectRoot;
+    try {
+      canonicalNew = realpathSync(newProjectRoot);
+    } catch {}
+    try {
+      canonicalCurrent = realpathSync(currentContext!.projectRoot);
+    } catch {}
+
+    if (canonicalNew !== canonicalCurrent) {
+      const oldContext = currentContext!;
+      currentContext = await openProjectContext(newProjectRoot);
+      oldContext.database.close();
+    }
+  };
+
+  let server: Server;
+
+  const ensureRootsValidated = async (): Promise<void> => {
+    if (!rootsValidationPromise && server.getClientCapabilities()?.roots) {
+      rootsValidationPromise = (async () => {
+        const result = await server.listRoots();
+        if (result?.roots && result.roots.length > 0) {
+          const rootPaths = result.roots.map((r) => r.uri);
+          await validateRoots(rootPaths);
+        }
+      })();
+    }
+    if (rootsValidationPromise) {
+      await rootsValidationPromise;
+    }
+  };
+
+  const getContext = async (): Promise<ProjectContext> => {
+    await ensureRootsValidated();
+    return currentContext!;
+  };
+
+  server = createMcpServer(getContext);
+
+  const transport = new StdioServerTransport();
+  transport.onclose = () => {
+    currentContext?.database.close();
+  };
+
+  server.setNotificationHandler(InitializedNotificationSchema, async () => {
+    if (server.getClientCapabilities()?.roots) {
+      try {
+        await ensureRootsValidated();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Error validating workspace roots: ${message}\n`);
+        transport.close();
+      }
+    }
+  });
+
+  server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+    if (server.getClientCapabilities()?.roots) {
+      try {
+        rootsValidationPromise = undefined;
+        await ensureRootsValidated();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`Error validating workspace roots: ${message}\n`);
+        transport.close();
+      }
+    }
+  });
+
+  try {
+    await server.connect(transport);
+  } catch (error) {
+    currentContext.database.close();
+    throw error;
+  }
+}

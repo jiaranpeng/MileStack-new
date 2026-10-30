@@ -1,0 +1,1 @@
+ALTER TABLE `tasks` ADD `plain_language_description` text;

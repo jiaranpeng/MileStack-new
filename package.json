@@ -1,0 +1,81 @@
+{
+  "name": "milestack",
+  "version": "0.2.1-custom.1",
+  "milestackDistribution": "custom",
+  "license": "Apache-2.0",
+  "description": "MileStack 定制版：本地任务管理、Codex 桌面执行、业务说明、图片传递与自动端口。",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiaranpeng/MileStack-new.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jiaranpeng/MileStack-new/issues"
+  },
+  "homepage": "https://github.com/jiaranpeng/MileStack-new#readme",
+  "keywords": [
+    "milestack",
+    "mcp",
+    "model-context-protocol",
+    "coding-agent",
+    "task-management",
+    "project-management",
+    "sqlite",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist/*.js",
+    "dist/migrations",
+    "dist/ui"
+  ],
+  "type": "module",
+  "packageManager": "pnpm@10.29.2",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "milestack": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup && vite build",
+    "build:ui": "vite build",
+    "dev:ui": "vite",
+    "serve": "node dist/index.js serve",
+    "db:generate": "drizzle-kit generate",
+    "typecheck": "tsc --noEmit",
+    "typecheck:ui": "tsc -p tsconfig.ui.json --noEmit",
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "prepack": "npm run typecheck && npm run typecheck:ui && npm test"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "drizzle-kit": "^0.31.11",
+    "lucide-react": "^1.55.0",
+    "tailwindcss": "^4.3.3",
+    "tsup": "^8.5.0",
+    "tsx": "4.23.15",
+    "typescript": "^5.8.3",
+    "vite": "^8.3.4",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.1",
+    "@fastify/static": "^10.1.6",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@tanstack/react-query": "^5.104.1",
+    "better-sqlite3": "^13.0.3",
+    "drizzle-orm": "^0.45.4",
+    "fastify": "^5.12.5",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zod": "^4.6.5"
+  }
+}
